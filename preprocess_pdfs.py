@@ -1,9 +1,62 @@
 import fitz  # PyMuPDF
 import os
 import json
+import re
 from pathlib import Path
 from typing import List, Dict
 from tqdm import tqdm
+
+def clean_text(text: str) -> str:
+    """Cleans extracted PDF text by removing TOC, headers, footers and unnecessary whitespace.
+    
+    Args:
+        text (str): Raw text extracted from PDF
+        
+    Returns:
+        str: Cleaned text
+    """
+    # Remove common PDF artifacts and clean text
+    cleaned = text
+    
+    # Remove ETSI/3GPP document headers and footers
+    cleaned = re.sub(r'ETSI\s+ETSI TS \d+\s+\d+\s+V\d+\.\d+\.\d+\s+\(\d{4}-\d{2}\)', '', cleaned)
+    cleaned = re.sub(r'3GPP TS \d+\.\d+ version \d+\.\d+\.\d+ Release \d+', '', cleaned)
+    
+    # Remove ETSI address and legal information
+    cleaned = re.sub(r'ETSI\s+\d+ Route des Lucioles.*?non lucratif.*?Grasse.*?Important notice.*?authorization of ETSI\.', '', cleaned, flags=re.DOTALL)
+    
+    # Remove page numbers and headers/footers
+    cleaned = re.sub(r'\n\s*\d+\s*\n', '\n', cleaned)
+    cleaned = re.sub(r'\f', ' ', cleaned)  # Form feed characters
+    
+    # Remove Table of Contents section
+    toc_patterns = [
+        r'Table of Contents.*?(?=\d+\s+Scope)', # From TOC until Scope section
+        r'Contents.*?(?=\d+\s+Scope)',          # Alternative TOC header
+        r'(?:\n\d+\.[\d\.]*\s+.*?(?=\n)){3,}'  # Consecutive numbered entries
+    ]
+    
+    for pattern in toc_patterns:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    
+    # Remove section numbers at start of lines (common in 3GPP docs)
+    cleaned = re.sub(r'^\s*\d+\.[\d\.]*\s+', '', cleaned, flags=re.MULTILINE)
+    
+    # Remove page numbers and section references
+    cleaned = re.sub(r'(?m)^\s*\d+\s*$', '', cleaned)  # Standalone page numbers
+    cleaned = re.sub(r'\s*\.\.\.\.*\s*\d+', '', cleaned)  # Section references with dots
+    
+    # Remove repeated document references
+    cleaned = re.sub(r'Reference RTS/TSGC-\d+.*?Keywords.*?\n', '', cleaned, flags=re.DOTALL)
+    
+    # Clean up excessive whitespace
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    cleaned = re.sub(r'\n\s*\n+', '\n\n', cleaned)
+    
+    # Remove any remaining dots-only lines (common in TOC)
+    cleaned = re.sub(r'^\.*\s*$', '', cleaned, flags=re.MULTILINE)
+    
+    return cleaned.strip()
 
 def extract_text_from_pdf(pdf_path):
     """Extracts text from a given PDF file"""
@@ -12,42 +65,83 @@ def extract_text_from_pdf(pdf_path):
         text = ""
         for page in doc:
             text += page.get_text("text") + "\n"
+        
         if text:
             print("Text extracted successfully!")
+            # Clean the extracted text
+            text = clean_text(text)
+            if not text:
+                print("Warning: Text was empty after cleaning.")
         else:
             print("Warning: No text extracted from the PDF.")
+            
         return text
     except Exception as e:
         print(f"Error processing PDF: {str(e)}")
         return ""
 
-def save_text_chunks(text, chunk_size=500):
-    """Splits text into smaller chunks for retrieval"""
+def save_text_chunks(text, chunk_size=1000):
+    """Splits text into smaller chunks for retrieval, respecting natural text boundaries.
+    
+    Args:
+        text (str): Text to split into chunks
+        chunk_size (int): Target size for each chunk
+        
+    Returns:
+        List[str]: List of text chunks
+    """
     if not text:
         print("No text available to chunk.")
         return []
     
-    # Split text into chunks, trying to break at sentence boundaries
-    chunks = []
-    current_pos = 0
+    # First split into paragraphs
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
     
-    while current_pos < len(text):
-        # Get the next chunk_size characters
-        chunk_end = min(current_pos + chunk_size, len(text))
-        chunk = text[current_pos:chunk_end]
-        
-        # If we're not at the end, try to find a sentence boundary
-        if chunk_end < len(text):
-            # Look for sentence endings (., !, ?)
-            last_period = max(chunk.rfind('. '), chunk.rfind('! '), chunk.rfind('? '))
-            if last_period != -1:
-                chunk = chunk[:last_period + 1]
-                chunk_end = current_pos + last_period + 1
-        
-        chunks.append(chunk.strip())
-        current_pos = chunk_end
+    chunks = []
+    current_chunk = []
+    current_size = 0
+    
+    for paragraph in paragraphs:
+        # If a single paragraph is longer than chunk_size, split it into sentences
+        if len(paragraph) > chunk_size:
+            # Split into sentences (handling common abbreviations)
+            sentences = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!)\s', paragraph)
+            
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                    
+                # If adding this sentence exceeds chunk_size and we have content,
+                # save current chunk and start new one
+                if current_size + len(sentence) > chunk_size and current_chunk:
+                    chunks.append(' '.join(current_chunk))
+                    current_chunk = []
+                    current_size = 0
+                
+                current_chunk.append(sentence)
+                current_size += len(sentence) + 1  # +1 for space
+                
+        else:
+            # If adding this paragraph exceeds chunk_size and we have content,
+            # save current chunk and start new one
+            if current_size + len(paragraph) > chunk_size and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = []
+                current_size = 0
+            
+            current_chunk.append(paragraph)
+            current_size += len(paragraph) + 2  # +2 for paragraph break
+    
+    # Add any remaining content
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
     
     print(f"Text split into {len(chunks)} chunks.")
+    
+    # Verify no empty chunks and no extremely short chunks
+    chunks = [chunk for chunk in chunks if len(chunk) > 50]  # Filter out very short chunks
+    
     return chunks
 
 def read_pdfs_from_directory(directory: str = "data", pattern: str = "*.pdf") -> List[Dict[str, str]]:
