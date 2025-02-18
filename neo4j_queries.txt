@@ -1,0 +1,189 @@
+// Basic Queries
+
+// 1. View all entities with their types
+MATCH (n:`3GPP Entity`)
+RETURN n.name, n.type
+ORDER BY n.type, n.name;
+
+// 2. View all relationships with their descriptions
+MATCH (source:`3GPP Entity`)-[r]->(target:`3GPP Entity`)
+RETURN source.name, type(r), r.description, target.name
+ORDER BY type(r);
+
+// Entity-Specific Queries
+
+// 3. Find all UE-related entities and their relationships
+MATCH (ue:`3GPP Entity`)-[r]-(other:`3GPP Entity`)
+WHERE ue.type = 'UE'
+RETURN ue.name, type(r), r.description, other.name, other.type;
+
+// 4. Find all AMF interactions
+MATCH (amf:`3GPP Entity`)-[r]-(other:`3GPP Entity`)
+WHERE amf.type = 'AMF'
+RETURN amf.name, type(r), r.description, other.name, other.type;
+
+// Relationship-Specific Queries
+
+// 5. View all registration-related relationships with context
+MATCH (source:`3GPP Entity`)-[r:REGISTERS_WITH]->(target:`3GPP Entity`)
+RETURN source.name, target.name, r.description, r.context;
+
+// 6. View all authentication relationships with their properties
+MATCH (source:`3GPP Entity`)-[r:AUTHENTICATES]->(target:`3GPP Entity`)
+RETURN source.name, target.name, r.description, r.timing, r.conditions;
+
+// Complex Queries
+
+// 7. Find all paths between UE and AMF
+MATCH path = (ue:`3GPP Entity`)-[*1..3]-(amf:`3GPP Entity`)
+WHERE ue.type = 'UE' AND amf.type = 'AMF'
+RETURN path;
+
+// 8. Find entities with the most relationships
+MATCH (n:`3GPP Entity`)-[r]-()
+RETURN n.name, n.type, count(r) as relationship_count
+ORDER BY relationship_count DESC
+LIMIT 10;
+
+// Property-Based Queries
+
+// 9. Find relationships with specific timing conditions
+MATCH (source:`3GPP Entity`)-[r]->(target:`3GPP Entity`)
+WHERE exists(r.timing)
+RETURN source.name, type(r), r.timing, target.name;
+
+// 10. Find relationships with specific conditions
+MATCH (source:`3GPP Entity`)-[r]->(target:`3GPP Entity`)
+WHERE exists(r.conditions)
+RETURN source.name, type(r), r.conditions, target.name;
+
+// Procedure-Related Queries
+
+// 11. Find all registration procedures and their participants
+MATCH (n:`3GPP Entity`)-[r]-(proc:`3GPP Entity`)
+WHERE proc.type = 'REGISTRATION'
+RETURN n.name, n.type, type(r), proc.name;
+
+// 12. Find connection establishment patterns
+MATCH (source:`3GPP Entity`)-[r:ESTABLISHES]->(target:`3GPP Entity`)
+RETURN source.name, target.name, r.description, r.context;
+
+// Analysis Queries
+
+// 13. Count relationships by type
+MATCH ()-[r]->()
+RETURN type(r), count(*) as count
+ORDER BY count DESC;
+
+// 14. Count entities by type
+MATCH (n:`3GPP Entity`)
+RETURN n.type, count(*) as count
+ORDER BY count DESC;
+
+// 15. Find isolated entities (no relationships)
+MATCH (n:`3GPP Entity`)
+WHERE NOT (n)-[]-()
+RETURN n.name, n.type;
+
+// Visualization Queries
+
+// 16. Get a complete subgraph for UE interactions
+MATCH path = (ue:`3GPP Entity`)-[*1..2]-(other:`3GPP Entity`)
+WHERE ue.type = 'UE'
+RETURN path;
+
+// 17. Get a complete subgraph for AMF interactions
+MATCH path = (amf:`3GPP Entity`)-[*1..2]-(other:`3GPP Entity`)
+WHERE amf.type = 'AMF'
+RETURN path;
+
+// 18. Get all relationships with their full context
+MATCH (source:`3GPP Entity`)-[r]->(target:`3GPP Entity`)
+RETURN {
+    source: source.name,
+    sourceType: source.type,
+    relationship: type(r),
+    description: r.description,
+    context: r.context,
+    target: target.name,
+    targetType: target.type
+} as relationship;
+
+// Maintenance Queries
+
+// 19. Find relationships without descriptions
+MATCH (source:`3GPP Entity`)-[r]->(target:`3GPP Entity`)
+WHERE NOT exists(r.description)
+RETURN source.name, type(r), target.name;
+
+// 20. Find duplicate relationships between same entities
+MATCH (a:`3GPP Entity`)-[r1]->(b:`3GPP Entity`)
+MATCH (a)-[r2]->(b)
+WHERE id(r1) < id(r2) AND type(r1) = type(r2)
+RETURN a.name, type(r1), b.name, count(*) as duplicate_count;
+
+// Flow of Execution Queries
+
+// 21. Registration Flow
+MATCH path = (start:`3GPP Entity`)-[r*1..5]->(end:`3GPP Entity`)
+WHERE (start.type = 'UE' OR start.type = 'AMF')
+  AND exists((start)-[:INITIATES|REGISTERS_WITH|AUTHENTICATES|PROCESSES]->())
+RETURN path
+ORDER BY length(path);
+
+// 22. Authentication Flow
+MATCH path = (start:`3GPP Entity`)-[r*1..4]->(end:`3GPP Entity`)
+WHERE type(r[0]) = 'AUTHENTICATES'
+RETURN path
+ORDER BY length(path);
+
+// 23. Connection Establishment Flow
+MATCH path = (start:`3GPP Entity`)-[r*1..4]->(end:`3GPP Entity`)
+WHERE type(r[0]) = 'ESTABLISHES'
+  AND start.type = 'UE'
+RETURN path
+ORDER BY length(path);
+
+// 24. Service Request Flow
+MATCH path = (start:`3GPP Entity`)-[r*1..5]->(end:`3GPP Entity`)
+WHERE any(rel IN r WHERE type(rel) IN ['INITIATES', 'PROCESSES'])
+  AND any(node IN nodes(path) WHERE node.name CONTAINS 'Service Request')
+RETURN path
+ORDER BY length(path);
+
+// 25. Sequential Flow Analysis
+MATCH (n1:`3GPP Entity`)-[r1]->(n2:`3GPP Entity`)-[r2]->(n3:`3GPP Entity`)
+WHERE type(r1) <> type(r2)
+RETURN n1.name, type(r1), n2.name, type(r2), n3.name
+ORDER BY n1.name, n2.name;
+
+// 26. Procedure Initiation to Completion
+MATCH path = (initiator:`3GPP Entity`)-[r:INITIATES]->(proc:`3GPP Entity`)-[*1..3]->(target:`3GPP Entity`)
+WHERE initiator.type = 'UE'
+RETURN path;
+
+// 27. Message Flow Sequence
+MATCH (sender:`3GPP Entity`)-[r]->(receiver:`3GPP Entity`)
+WHERE type(r) IN ['SENDS', 'PROCESSES', 'ESTABLISHES']
+RETURN sender.name, type(r), r.description, receiver.name
+ORDER BY sender.name, receiver.name;
+
+// 28. State Transitions
+MATCH path = (start:`3GPP Entity`)-[r*1..3]->(end:`3GPP Entity`)
+WHERE any(rel IN r WHERE type(rel) = 'TRANSITIONS_TO')
+RETURN path;
+
+// 29. Complex Procedure Flow
+MATCH path = (start:`3GPP Entity`)-[r*1..6]->(end:`3GPP Entity`)
+WHERE 
+  start.type = 'UE' AND
+  any(rel IN r WHERE type(rel) IN ['INITIATES', 'REGISTERS_WITH', 'AUTHENTICATES', 'ESTABLISHES', 'PROCESSES'])
+WITH path, relationships(path) as rels
+WHERE size([rel IN rels WHERE type(rel) = 'INITIATES']) >= 1
+RETURN path
+ORDER BY length(path);
+
+// 30. Error Handling Flow
+MATCH path = (start:`3GPP Entity`)-[r*1..4]->(end:`3GPP Entity`)
+WHERE any(rel IN r WHERE rel.context CONTAINS 'error' OR rel.context CONTAINS 'fail' OR rel.context CONTAINS 'reject')
+RETURN path; 

@@ -4,8 +4,8 @@ uvicorn>=0.34.0  # ASGI server for FastAPI
 pydantic>=2.10.0  # Data validation
 
 # Data Processing
-pypdf>=5.2.0  # PDF processing
-python-dotenv>=1.0.0  # Environment variables
+pypdf>=3.0.0  # PDF processing
+python-dotenv>=0.19.0  # Environment variables
 neo4j>=5.28.0  # Graph database
 
 # Knowledge Graph and Visualization
@@ -19,8 +19,18 @@ langchain-google-genai>=0.0.11  # Google Generative AI integration
 google-generativeai>=0.4.0  # Google Generative AI
 
 # Logging and utilities
-rich>=13.9.0  # Better console output
+rich>=10.0.0  # Better console output
 tqdm>=4.65.0  # Progress bars
+
+# NLP Libraries
+nltk>=3.8.1
+spacy>=3.7.2
 
 # to install all the requirements
 # pip install -r requirements.txt
+
+# Additional dependencies for the enhanced preprocessor
+tabula-py>=2.7.0
+pandas>=1.5.0
+numpy>=1.23.0
+concurrent-futures>=3.0.5
