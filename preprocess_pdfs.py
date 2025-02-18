@@ -3,7 +3,7 @@ import os
 import json
 import re
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Any
 from tqdm import tqdm
 
 def clean_text(text: str) -> str:
@@ -144,15 +144,16 @@ def save_text_chunks(text, chunk_size=1000):
     
     return chunks
 
-def read_pdfs_from_directory(directory: str = "data", pattern: str = "*.pdf") -> List[Dict[str, str]]:
-    """Read all PDFs from a directory and return their contents.
+def read_pdfs_from_directory(directory: str = "data", pattern: str = "*.pdf", chunk_size: int = 1000) -> List[Dict[str, Any]]:
+    """Read all PDFs from a directory and return their contents in chunks.
     
     Args:
         directory (str): Directory containing PDF files
         pattern (str): Glob pattern for PDF files
+        chunk_size (int): Size of text chunks
         
     Returns:
-        List[Dict[str, str]]: List of documents with their metadata and content
+        List[Dict[str, Any]]: List of documents with their metadata and chunked content
     """
     directory_path = Path(directory)
     if not directory_path.exists():
@@ -172,12 +173,17 @@ def read_pdfs_from_directory(directory: str = "data", pattern: str = "*.pdf") ->
             # Extract text from PDF
             text = extract_text_from_pdf(str(pdf_file))
             if text:
-                doc_info = {
-                    'file_path': str(pdf_file),
-                    'filename': pdf_file.name,
-                    'content': text
-                }
-                documents.append(doc_info)
+                # Split text into chunks
+                chunks = save_text_chunks(text, chunk_size)
+                for i, chunk in enumerate(chunks):
+                    doc_info = {
+                        'file_path': str(pdf_file),
+                        'filename': pdf_file.name,
+                        'chunk_number': i + 1,
+                        'total_chunks': len(chunks),
+                        'content': chunk
+                    }
+                    documents.append(doc_info)
         except Exception as e:
             print(f"Error processing {pdf_file}: {str(e)}")
             continue
