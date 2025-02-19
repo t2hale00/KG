@@ -176,26 +176,54 @@ class ThreeGPPGraphExtractor:
         return hashlib.md5(content.encode()).hexdigest()
 
     def _wait_for_rate_limit(self):
-        """Enhanced rate limiting with adaptive delays."""
+        """Enhanced rate limiting with adaptive delays and jitter."""
         current_time = time.time()
         time_since_last_request = current_time - self.last_request_time
         
-        if time_since_last_request < self.min_request_interval:
-            sleep_time = self.min_request_interval - time_since_last_request
-            # Add small random jitter to prevent synchronized requests
-            sleep_time += random.uniform(0, 1)
-            time.sleep(sleep_time)
+        # Base delay with exponential backoff based on retry count
+        base_delay = self.min_request_interval * (1.5 ** self.retry_count)
+        
+        if time_since_last_request < base_delay:
+            # Calculate sleep time and add random jitter
+            sleep_time = base_delay - time_since_last_request
+            jitter = random.uniform(0, min(1.0, sleep_time * 0.1))  # 10% jitter
+            total_sleep = sleep_time + jitter
+            
+            # Cap the maximum sleep time
+            total_sleep = min(total_sleep, self.max_retry_delay)
+            
+            time.sleep(total_sleep)
         
         self.last_request_time = time.time()
 
     def _handle_api_error(self, e: Exception, chunk_id: int = None) -> bool:
-        """Enhanced error handling with exponential backoff."""
-        if "429" in str(e) or "quota" in str(e).lower():
+        """Enhanced error handling with better error classification and recovery."""
+        error_str = str(e).lower()
+        
+        # Classify error type
+        is_quota_error = "429" in error_str or "quota" in error_str
+        is_timeout_error = "timeout" in error_str or "deadline" in error_str
+        is_connection_error = "connection" in error_str or "network" in error_str
+        
+        if any([is_quota_error, is_timeout_error, is_connection_error]):
             if self.retry_count < self.max_retries:
                 self.retry_count += 1
-                # Calculate delay with exponential backoff
-                delay = min(self.base_retry_delay * (2 ** (self.retry_count - 1)), self.max_retry_delay)
-                print(f"\nQuota error encountered. Waiting {delay} seconds before retry {self.retry_count}/{self.max_retries}")
+                
+                # Calculate delay with exponential backoff and error-specific base delays
+                if is_quota_error:
+                    base_delay = self.base_retry_delay * 2
+                elif is_timeout_error:
+                    base_delay = self.base_retry_delay * 1.5
+                else:  # connection error
+                    base_delay = self.base_retry_delay
+                
+                delay = min(base_delay * (2 ** (self.retry_count - 1)), self.max_retry_delay)
+                
+                # Add some randomization to prevent thundering herd
+                delay *= random.uniform(0.8, 1.2)
+                
+                error_type = "Quota" if is_quota_error else "Timeout" if is_timeout_error else "Connection"
+                print(f"\n{error_type} error encountered. Waiting {delay:.1f} seconds before retry {self.retry_count}/{self.max_retries}")
                 
                 # Save progress before waiting
                 if chunk_id is not None:
@@ -208,454 +236,416 @@ class ThreeGPPGraphExtractor:
                 time.sleep(delay)
                 return True
             else:
-                print("\nMax retries reached. Saving progress and continuing with next chunk...")
+                print(f"\nMax retries ({self.max_retries}) reached. Saving progress and continuing with next chunk...")
                 self.retry_count = 0
                 return False
+                
+        # For other types of errors, log them but don't retry
+        print(f"\nUnexpected error: {str(e)}")
         return False
 
     def _create_node_extraction_prompt(self, text: str) -> str:
-        """Create prompt for node extraction."""
-        return f"""
-        Analyze this 3GPP specification text and extract nodes for all procedures.
-        Focus on identifying these types of nodes:
+        """Create optimized prompt for node extraction."""
+        return f"""Extract network elements, states, and events as a JSON array. Each item must have this structure:
+{{
+    "node": true,
+    "name": "node name",
+    "type": "NetworkElement|State|Event",
+    "description": "brief description"
+}}
 
-        1. State Nodes:
-           - Initial states (e.g., IDLE, DEREGISTERED)
-           - Intermediate states (e.g., CONNECTING, AUTHENTICATING)
-           - Final states (e.g., CONNECTED, REGISTERED)
-           Properties to include:
-           - state_type: "initial", "intermediate", or "final"
-           - entry_conditions: conditions required to enter this state
-           - exit_conditions: conditions that trigger exit from this state
-           - description: detailed description of the state
-           - metadata: {{
-               "timeout": timeout value if applicable,
-               "retry_count": max retry count if applicable,
-               "security_context": security context if applicable,
-               "procedure": procedure this state belongs to
-           }}
+Example output:
+[
+    {{
+        "node": true,
+        "name": "UE",
+        "type": "NetworkElement",
+        "description": "User Equipment"
+    }}
+]
 
-        2. Event Nodes:
-           - Message events (e.g., REQUEST_RECEIVED, RESPONSE_SENT)
-           - Timer events (e.g., T3510_EXPIRED, GUARD_TIMER_EXPIRED)
-           - Internal events (e.g., SECURITY_CONTEXT_CREATED)
-           Properties to include:
-           - event_type: "message", "timer", or "internal"
-           - source_entity: entity that generates the event
-           - target_entity: entity that receives the event
-           - parameters: list of parameters associated with the event
-           - metadata: {{
-               "protocol": protocol used (e.g., "NAS", "RRC", "NGAP"),
-               "message_type": message type if applicable,
-               "timer_value": timer duration if applicable,
-               "retry_count": max retry count if applicable,
-               "procedure": procedure this event belongs to
-           }}
+Text to analyze:
+{text}
 
-        3. Network Element Nodes:
-           - Core Network elements (e.g., AMF, SMF, UPF)
-           - Access Network elements (e.g., gNB, ng-eNB)
-           - User Equipment (UE)
-           Properties to include:
-           - element_type: "core_network", "access_network", or "user_equipment"
-           - role: primary function in the network
-           - interfaces: list of supported interfaces
-           - metadata: {{
-               "network_type": "5G", "4G", etc.,
-               "supported_procedures": list of procedures this element participates in
-           }}
-
-        4. Conditional Nodes:
-           - Decision points in procedures
-           Properties to include:
-           - condition_type: "validation", "capability_check", "timer_check", etc.
-           - true_path: action/state when condition is true
-           - false_path: action/state when condition is false
-           - parameters: list of parameters involved in the condition
-           - metadata: {{
-               "procedure": procedure this condition belongs to,
-               "retry_allowed": whether retry is allowed on false path,
-               "error_handling": how errors are handled
-           }}
-
-        5. Parameter Nodes:
-           - Message parameters (e.g., IMSI, GUTI, TAI)
-           - Configuration parameters
-           Properties to include:
-           - parameter_type: "identifier", "capability", "configuration", etc.
-           - format: data format or structure
-           - mandatory: whether parameter is mandatory
-           - metadata: {{
-               "procedures": list of procedures using this parameter,
-               "validation_rules": rules for parameter validation
-           }}
-
-        Text to analyze:
-        {text}
-
-        Return ONLY a JSON object with this exact structure:
-        {{
-            "nodes": [
-                {{
-                    "id": "node_name",
-                    "type": "State|Event|NetworkElement|Conditional|Parameter",
-                    "properties": {{
-                        // Include appropriate properties based on node type as described above
-                        "state_type": "state_type_value",  // For State nodes
-                        "event_type": "event_type_value",  // For Event nodes
-                        "element_type": "element_type_value",  // For NetworkElement nodes
-                        "condition_type": "condition_type_value",  // For Conditional nodes
-                        "parameter_type": "parameter_type_value",  // For Parameter nodes
-                        // Common properties
-                        "description": "detailed description",
-                        "metadata": {{
-                            // Include appropriate metadata based on node type
-                        }}
-                    }}
-                }}
-            ]
-        }}
-        """
+Return ONLY a valid JSON array."""
 
     def _create_edge_extraction_prompt(self, text: str) -> str:
-        """Create prompt for edge extraction."""
-        return f"""
-        Analyze this 3GPP specification text and extract edges (relationships) between nodes.
-        Focus on these types of relationships:
+        """Create optimized prompt for edge extraction."""
+        return f"""Extract relationships as a JSON array. Each item must have this structure:
+{{
+    "edge": true,
+    "source": "source node name",
+    "target": "target node name",
+    "type": "SENDS|TRANSITIONS_TO|TRIGGERS",
+    "description": "brief description"
+}}
 
-        1. State Transitions:
-           - Between states in the same procedure
-           - Cross-procedure transitions
-           Properties to include:
-           - trigger_event: event causing the transition
-           - conditions: list of conditions that must be met
-           - parameters: list of parameters involved
-           - metadata: {{
-               "procedure": procedure this transition belongs to,
-               "protocol": protocol used,
-               "timer_value": timer duration if applicable,
-               "security_context": security context if applicable
-           }}
+Example output:
+[
+    {{
+        "edge": true,
+        "source": "UE",
+        "target": "AMF",
+        "type": "SENDS",
+        "description": "Registration request"
+    }}
+]
 
-        2. Message Flows:
-           - Between network elements
-           - Protocol-specific interactions
-           Properties to include:
-           - message_type: type of message
-           - direction: "uplink" or "downlink"
-           - parameters: list of parameters in the message
-           - metadata: {{
-               "procedure": procedure this message belongs to,
-               "protocol": protocol used,
-               "security_required": whether security is required,
-               "retry_behavior": retry behavior if message fails
-           }}
+Text to analyze:
+{text}
 
-        3. Timer Relationships:
-           - Timer start/stop events
-           - Timer expiry actions
-           Properties to include:
-           - timer_action: "start", "stop", or "expire"
-           - target_state: state to transition to on expiry
-           - metadata: {{
-               "procedure": procedure this timer belongs to,
-               "duration": timer duration,
-               "retry_count": number of retries allowed
-           }}
+Return ONLY a valid JSON array."""
 
-        4. Conditional Flows:
-           - Decision paths
-           - Error handling paths
-           Properties to include:
-           - condition: the condition being evaluated
-           - true_path: next step if condition is true
-           - false_path: next step if condition is false
-           - metadata: {{
-               "procedure": procedure this flow belongs to,
-               "error_handling": how errors are handled,
-               "retry_allowed": whether retry is allowed
-           }}
-
-        5. Parameter Dependencies:
-           - Parameter validations
-           - Parameter requirements
-           Properties to include:
-           - dependency_type: "requires", "validates", or "configures"
-           - validation_rules: rules for parameter validation
-           - metadata: {{
-               "procedure": procedure this dependency belongs to,
-               "mandatory": whether dependency is mandatory
-           }}
-
-        6. Procedure Links:
-           - Between different procedures
-           - Sub-procedure relationships
-           Properties to include:
-           - link_type: "triggers", "depends_on", or "includes"
-           - conditions: conditions for the link
-           - metadata: {{
-               "network_type": network type (4G/5G),
-               "priority": priority of the link,
-               "fallback": fallback procedure if available
-           }}
-
-        Text to analyze:
-        {text}
-
-        Return ONLY a JSON object with this exact structure:
-        {{
-            "edges": [
-                {{
-                    "source": "source_node_name",
-                    "target": "target_node_name",
-                    "type": "transitions_to|sends|triggers|requires|validates|includes",
-                    "properties": {{
-                        // Include appropriate properties based on edge type
-                        "trigger_event": "event_name",  // For state transitions
-                        "message_type": "message_type",  // For message flows
-                        "timer_action": "action_type",  // For timer relationships
-                        "condition": "condition_expr",  // For conditional flows
-                        "dependency_type": "dep_type",  // For parameter dependencies
-                        "link_type": "link_type",  // For procedure links
-                        // Common properties
-                        "parameters": ["param1", "param2"],
-                        "conditions": ["condition1", "condition2"],
-                        "metadata": {{
-                            "procedure": "procedure_name",
-                            "protocol": "protocol_name",
-                            // Additional metadata based on edge type
-                        }}
-                    }}
-                }}
-            ]
-        }}
-        """
-
-    def extract_nodes_and_edges(self, text: str) -> Tuple[List[Node], List[Edge]]:
-        """Extract both nodes and edges from the text."""
+    def _extract_nodes(self, text: str) -> List[Node]:
+        """Extract nodes using JSON format with enhanced debugging."""
         nodes = []
-        edges = []
+        retry = True
+        attempts = 0
+        max_attempts = 3
         
-        try:
-            # Clean and normalize the text first
-            cleaned_text = self._normalize_text(text)
-            
-            # Extract nodes first
-            retry = True
-            node_extraction_attempts = 0
-            max_attempts = 3
-            
-            while retry and node_extraction_attempts < max_attempts:
+        while retry and attempts < max_attempts:
+            try:
+                self._wait_for_rate_limit()
+                
+                # Debug: Print input text
+                print("\n=== Input Text Preview ===")
+                print(f"Length: {len(text)} characters")
+                print("First 200 chars:")
+                print(text[:200])
+                print("=== End Input Text Preview ===\n")
+                
+                # Get model response
+                print("Sending extraction prompt to model...")
+                response = self.model.generate_content(
+                    self._create_node_extraction_prompt(text),
+                    generation_config=self.generation_config
+                )
+                
+                # Debug: Print raw response
+                print("\n=== Raw Model Response ===")
+                print(response.text)
+                print("=== End Raw Model Response ===\n")
+                
                 try:
-                    self._wait_for_rate_limit()
-                    node_response = self.model.generate_content(
-                        self._create_node_extraction_prompt(cleaned_text),
-                        generation_config=self.generation_config
-                    )
+                    # Parse JSON response
+                    node_data = json.loads(response.text)
+                    print(f"\nParsed {len(node_data)} nodes from JSON")
                     
-                    # Clean and parse the response
-                    node_text = node_response.text
-                    
-                    # Clean the response text
-                    # First remove any markdown code block indicators
-                    node_text = re.sub(r'```(?:json)?', '', node_text)
-                    node_text = re.sub(r'```', '', node_text)
-                    node_text = node_text.strip()
-                    
-                    # Remove comments
-                    node_text = re.sub(r'//.*$', '', node_text, flags=re.MULTILINE)
-                    
-                    # Remove trailing commas in objects and arrays
-                    node_text = re.sub(r',(\s*[}\]])', r'\1', node_text)
-                    
-                    try:
-                        node_data = json.loads(node_text)
-                        if isinstance(node_data, dict) and "nodes" in node_data:
-                            for node in node_data.get("nodes", []):
-                                try:
-                                    # Validate node structure
-                                    if not isinstance(node, dict):
-                                        print(f"Warning: Invalid node format: {node}")
-                                        continue
-                                    
-                                    required_fields = ["id", "type", "name"]
-                                    if not all(field in node for field in required_fields):
-                                        missing = [f for f in required_fields if f not in node]
-                                        print(f"Warning: Node missing required fields {missing}: {node}")
-                                        continue
-                                    
-                                    # Normalize node type
-                                    node["type"] = node["type"].strip().title()
-                                    if node["type"] not in ["State", "Event", "NetworkElement", "Conditional", "Parameter"]:
-                                        print(f"Warning: Invalid node type '{node['type']}', skipping")
-                                        continue
-                                    
-                                    # Ensure properties is a dict
-                                    if "properties" not in node or not isinstance(node["properties"], dict):
-                                        node["properties"] = {}
-                                    
-                                    # Create the node
-                                    nodes.append(Node(**node))
-                                    
-                                except Exception as ne:
-                                    print(f"Error processing node: {str(ne)}")
-                                    continue
-                            retry = False
-                        else:
-                            print("Warning: Invalid node data format")
-                            node_extraction_attempts += 1
+                    valid_node_count = 0
+                    for i, node_json in enumerate(node_data, 1):
+                        try:
+                            # Validate required fields
+                            if not all(k in node_json for k in ['node', 'name', 'type', 'description']):
+                                print(f"Skipping node {i} - missing required fields")
+                                continue
                             
-                    except json.JSONDecodeError as je:
-                        print(f"Error parsing node JSON: {str(je)}")
-                        print("Response text:")
-                        print(node_text[:200] + "..." if len(node_text) > 200 else node_text)
-                        node_extraction_attempts += 1
+                            if not node_json['node']:
+                                print(f"Skipping node {i} - node field is not true")
+                                continue
+                            
+                            # Validate node type
+                            if node_json['type'] not in ['NetworkElement', 'State', 'Event']:
+                                print(f"Skipping node {i} - invalid type: {node_json['type']}")
+                                continue
+                            
+                            # Create node dictionary
+                            node = {
+                                'id': hashlib.md5(node_json['name'].encode()).hexdigest()[:8],
+                                'type': node_json['type'],
+                                'name': node_json['name'],
+                                'properties': {
+                                    'description': node_json['description']
+                                }
+                            }
+                            
+                            # Create Node object
+                            nodes.append(Node(**node))
+                            valid_node_count += 1
+                            print(f"Successfully created node: {node['type']} - {node['name']}")
+                            
+                        except Exception as e:
+                            print(f"Error processing node {i}: {str(e)}")
+                            continue
                     
-                except Exception as e:
-                    retry = self._handle_api_error(e)
+                    print(f"\nExtracted {valid_node_count} valid nodes from {len(node_data)} JSON objects")
+                    retry = False
+                    
+                except json.JSONDecodeError as je:
+                    print(f"\nError decoding JSON response: {str(je)}")
+                    retry = self._handle_api_error(je)
                     if not retry:
-                        print(f"Error extracting nodes: {str(e)}")
                         break
-                    node_extraction_attempts += 1
-            
-            if node_extraction_attempts >= max_attempts:
-                print("Warning: Max node extraction attempts reached")
-            
-            # Create normalized node name mappings
-            valid_nodes = {}
+                    attempts += 1
+                    time.sleep(5)
+                    
+            except Exception as e:
+                print(f"\nError in node extraction: {str(e)}")
+                retry = self._handle_api_error(e)
+                if not retry:
+                    break
+                attempts += 1
+                time.sleep(5)
+        
+        # Final summary
+        print("\n=== Node Extraction Summary ===")
+        print(f"Total nodes extracted: {len(nodes)}")
+        if nodes:
+            print("\nExtracted nodes:")
             for node in nodes:
-                # Store multiple variations of the name
-                norm_name = self._normalize_entity_name(node.name)
-                valid_nodes[norm_name] = node.name
-                valid_nodes[node.name.upper()] = node.name
-                valid_nodes[node.name] = node.name
-                valid_nodes[node.name.replace(" ", "")] = node.name
-            
-            # Extract edges
-            retry = True
-            edge_extraction_attempts = 0
-            edge_set = set()
-            
-            while retry and edge_extraction_attempts < max_attempts:
+                print(f"- {node.type}: {node.name}")
+        else:
+            print("No nodes were extracted!")
+        print("=== End Summary ===\n")
+        
+        return nodes
+
+    def _extract_edges(self, text: str, nodes: List[Node]) -> List[Edge]:
+        """Extract edges using JSON format with enhanced debugging."""
+        edges = []
+        retry = True
+        attempts = 0
+        max_attempts = 3
+        
+        # Create node lookup maps
+        node_maps = self._create_node_maps(nodes)
+        
+        # Debug: Print available nodes
+        print("\n=== Available Nodes ===")
+        print(f"Total nodes: {len(nodes)}")
+        for node in nodes:
+            print(f"- {node.type}: {node.name}")
+        print("=== End Available Nodes ===\n")
+        
+        while retry and attempts < max_attempts:
+            try:
+                self._wait_for_rate_limit()
+                
+                # Debug: Print input text
+                print("\n=== Input Text Preview ===")
+                print(f"Length: {len(text)} characters")
+                print("First 200 chars:")
+                print(text[:200])
+                print("=== End Input Text Preview ===\n")
+                
+                # Get model response
+                print("Sending edge extraction prompt to model...")
+                response = self.model.generate_content(
+                    self._create_edge_extraction_prompt(text),
+                    generation_config=self.generation_config
+                )
+                
+                # Debug: Print raw response
+                print("\n=== Raw Model Response ===")
+                print(response.text)
+                print("=== End Raw Model Response ===\n")
+                
                 try:
-                    self._wait_for_rate_limit()
-                    edge_response = self.model.generate_content(
-                        self._create_edge_extraction_prompt(cleaned_text),
-                        generation_config=self.generation_config
-                    )
+                    # Parse JSON response
+                    edge_data = json.loads(response.text)
+                    print(f"\nParsed {len(edge_data)} edges from JSON")
                     
-                    # Clean and parse the response
-                    edge_text = edge_response.text
-                    
-                    # Clean the response text
-                    # First remove any markdown code block indicators
-                    edge_text = re.sub(r'```(?:json)?', '', edge_text)
-                    edge_text = re.sub(r'```', '', edge_text)
-                    edge_text = edge_text.strip()
-                    
-                    # Remove comments
-                    edge_text = re.sub(r'//.*$', '', edge_text, flags=re.MULTILINE)
-                    
-                    # Remove trailing commas in objects and arrays
-                    edge_text = re.sub(r',(\s*[}\]])', r'\1', edge_text)
-                    
-                    try:
-                        edge_data = json.loads(edge_text)
-                        if isinstance(edge_data, dict) and "edges" in edge_data:
-                            for edge in edge_data.get("edges", []):
-                                try:
-                                    # Validate edge structure
-                                    if not isinstance(edge, dict):
-                                        print(f"Warning: Invalid edge format: {edge}")
-                                        continue
-                                    
-                                    required_fields = ["source", "target", "type"]
-                                    if not all(field in edge for field in required_fields):
-                                        missing = [f for f in required_fields if f not in edge]
-                                        print(f"Warning: Edge missing required fields {missing}: {edge}")
-                                        continue
-                                    
-                                    source = self._normalize_entity_name(edge["source"])
-                                    target = self._normalize_entity_name(edge["target"])
-                                    
-                                    # Try different normalizations to find a match
-                                    source_variations = [
-                                        source,
-                                        source.upper(),
-                                        source.replace(" ", ""),
-                                        source.strip()
-                                    ]
-                                    target_variations = [
-                                        target,
-                                        target.upper(),
-                                        target.replace(" ", ""),
-                                        target.strip()
-                                    ]
-                                    
-                                    source_match = next((valid_nodes[var] for var in source_variations 
-                                                      if var in valid_nodes), None)
-                                    target_match = next((valid_nodes[var] for var in target_variations 
-                                                      if var in valid_nodes), None)
-                                    
-                                    if source_match and target_match:
-                                        # Normalize edge type
-                                        edge["type"] = edge["type"].strip().upper()
-                                        
-                                        # Ensure properties is a dict
-                                        if "properties" not in edge or not isinstance(edge["properties"], dict):
-                                            edge["properties"] = {}
-                                        
-                                        # Create edge key for deduplication
-                                        edge_key = f"{source_match}:{edge['type']}:{target_match}"
-                                        if edge_key not in edge_set:
-                                            edge_set.add(edge_key)
-                                            edge["source"] = source_match
-                                            edge["target"] = target_match
-                                            edges.append(Edge(**edge))
-                                    else:
-                                        if not source_match:
-                                            print(f"Warning: Source node '{source}' not found in valid nodes")
-                                        if not target_match:
-                                            print(f"Warning: Target node '{target}' not found in valid nodes")
-                                except Exception as ee:
-                                    print(f"Error processing edge: {str(ee)}")
-                                    continue
-                            retry = False
-                        else:
-                            print("Warning: Invalid edge data format")
-                            edge_extraction_attempts += 1
+                    valid_edge_count = 0
+                    for i, edge_json in enumerate(edge_data, 1):
+                        try:
+                            # Validate required fields
+                            if not all(k in edge_json for k in ['edge', 'source', 'target', 'type', 'description']):
+                                print(f"Skipping edge {i} - missing required fields")
+                                continue
                             
-                    except json.JSONDecodeError as je:
-                        print(f"Error parsing edge JSON: {str(je)}")
-                        print("Response text:")
-                        print(edge_text[:200] + "..." if len(edge_text) > 200 else edge_text)
-                        edge_extraction_attempts += 1
+                            if not edge_json['edge']:
+                                print(f"Skipping edge {i} - edge field is not true")
+                                continue
+                            
+                            # Match source and target nodes
+                            source_match = self._match_node(edge_json['source'], node_maps)
+                            if not source_match:
+                                print(f"Skipping edge {i} - source node not found: {edge_json['source']}")
+                                continue
+                            
+                            target_match = self._match_node(edge_json['target'], node_maps)
+                            if not target_match:
+                                print(f"Skipping edge {i} - target node not found: {edge_json['target']}")
+                                continue
+                            
+                            # Validate edge type
+                            edge_type = edge_json['type'].upper()
+                            if edge_type not in ['SENDS', 'TRANSITIONS_TO', 'TRIGGERS']:
+                                print(f"Skipping edge {i} - invalid type: {edge_type}")
+                                continue
+                            
+                            # Create edge dictionary
+                            edge = {
+                                'source': source_match,
+                                'target': target_match,
+                                'type': edge_type,
+                                'properties': {
+                                    'description': edge_json['description']
+                                }
+                            }
+                            
+                            # Create Edge object
+                            edges.append(Edge(**edge))
+                            valid_edge_count += 1
+                            print(f"Successfully created edge: {edge_json['source']} -{edge_type}-> {edge_json['target']}")
+                            
+                        except Exception as e:
+                            print(f"Error processing edge {i}: {str(e)}")
+                            continue
                     
-                except Exception as e:
-                    retry = self._handle_api_error(e)
+                    print(f"\nExtracted {valid_edge_count} valid edges from {len(edge_data)} JSON objects")
+                    retry = False
+                    
+                except json.JSONDecodeError as je:
+                    print(f"\nError decoding JSON response: {str(je)}")
+                    retry = self._handle_api_error(je)
                     if not retry:
-                        print(f"Error extracting edges: {str(e)}")
                         break
-                    edge_extraction_attempts += 1
+                    attempts += 1
+                    time.sleep(5)
+                    
+            except Exception as e:
+                print(f"\nError in edge extraction: {str(e)}")
+                retry = self._handle_api_error(e)
+                if not retry:
+                    break
+                attempts += 1
+                time.sleep(5)
+        
+        # Final summary
+        print("\n=== Edge Extraction Summary ===")
+        print(f"Total edges extracted: {len(edges)}")
+        if edges:
+            print("\nExtracted edges:")
+            for edge in edges:
+                print(f"- {edge.source} -{edge.type}-> {edge.target}")
+        else:
+            print("No edges were extracted!")
+        print("=== End Summary ===\n")
+        
+        return edges
+
+    def _create_node_maps(self, nodes: List[Node]) -> Dict[str, Dict[str, str]]:
+        """Create lookup maps for node matching."""
+        maps = {
+            "by_id": {},
+            "by_name": {},
+            "by_normalized": {}
+        }
+        
+        for node in nodes:
+            maps["by_id"][node.id] = node.id
+            maps["by_name"][node.name] = node.id
+            norm_name = self._normalize_entity_name(node.name)
+            maps["by_normalized"][norm_name] = node.id
+            maps["by_normalized"][norm_name.upper()] = node.id
+            maps["by_normalized"][norm_name.replace(" ", "")] = node.id
             
-            if edge_extraction_attempts >= max_attempts:
-                print("Warning: Max edge extraction attempts reached")
+        return maps
+
+    def _match_node(self, node_ref: str, node_maps: Dict[str, Dict[str, str]]) -> str:
+        """Match node reference to known node ID."""
+        if not node_ref:
+            return None
             
-            if not edges and nodes:
-                print(f"Found {len(nodes)} nodes but no edges were extracted.")
-            elif edges:
-                print(f"Successfully extracted {len(nodes)} nodes and {len(edges)} edges")
+        # Try direct ID match
+        if node_ref in node_maps["by_id"]:
+            return node_maps["by_id"][node_ref]
             
-            return nodes, edges
+        # Try name match
+        if node_ref in node_maps["by_name"]:
+            return node_maps["by_name"][node_ref]
             
-        except Exception as e:
-            print(f"Error in extract_nodes_and_edges: {str(e)}")
-            return [], []
+        # Try normalized matches
+        norm_ref = self._normalize_entity_name(node_ref)
+        if norm_ref in node_maps["by_normalized"]:
+            return node_maps["by_normalized"][norm_ref]
+            
+        return None
 
     def _process_chunk_batch(self, chunks: List[Dict[str, str]]) -> Tuple[List[Node], List[Edge]]:
-        """Process a batch of chunks together."""
-        combined_text = "\n\n".join([chunk['content'] for chunk in chunks])
-        return self.extract_nodes_and_edges(combined_text)
+        """Process a batch of chunks with optimized performance."""
+        try:
+            # Generate batch ID for Neo4j tracking
+            batch_id = f"batch_{int(time.time())}_{random.randint(1000, 9999)}"
+            
+            # Combine chunks with clear separators
+            combined_text = "\n\n=== SECTION BREAK ===\n\n".join([chunk['content'] for chunk in chunks])
+            
+            # Clean and normalize text
+            cleaned_text = self._normalize_text(combined_text)
+            
+            # Split into optimal-sized chunks (4000 chars with 500 char overlap)
+            chunk_size = 4000
+            overlap = 500
+            text_chunks = []
+            
+            for i in range(0, len(cleaned_text), chunk_size - overlap):
+                chunk = cleaned_text[i:i + chunk_size]
+                if chunk:
+                    text_chunks.append(chunk)
+            
+            print(f"\nProcessing {len(text_chunks)} optimized chunks...")
+            
+            # Process chunks in parallel
+            all_nodes = []
+            all_edges = []
+            node_cache = set()
+            
+            # First extract all nodes
+            for chunk in text_chunks:
+                nodes = self._extract_nodes(chunk)
+                for node in nodes:
+                    node_key = f"{node.type}:{node.name}"
+                    if node_key not in node_cache:
+                        node_cache.add(node_key)
+                        all_nodes.append(node)
+            
+            print(f"\nExtracted {len(all_nodes)} unique nodes")
+            
+            # Then extract edges using all known nodes
+            if all_nodes:
+                for chunk in text_chunks:
+                    edges = self._extract_edges(chunk, all_nodes)
+                    all_edges.extend(edges)
+                
+                print(f"Extracted {len(all_edges)} edges")
+                
+                # Store in Neo4j
+                try:
+                    from store_data_neo4j import store_batch_in_neo4j
+                    
+                    # Convert to dicts for storage
+                    node_dicts = [
+                        {
+                            "id": node.id,
+                            "type": node.type,
+                            "name": node.name,
+                            "properties": node.properties
+                        } 
+                        for node in all_nodes
+                    ]
+                    
+                    edge_dicts = [
+                        {
+                            "source": edge.source,
+                            "target": edge.target,
+                            "type": edge.type,
+                            "properties": edge.properties
+                        }
+                        for edge in all_edges
+                    ]
+                    
+                    # Store in single batch
+                    store_batch_in_neo4j(node_dicts, edge_dicts, batch_id)
+                    
+                except Exception as e:
+                    print(f"Warning: Error storing in Neo4j: {str(e)}")
+            
+            return all_nodes, all_edges
+            
+        except Exception as e:
+            print(f"Error in batch processing: {str(e)}")
+            return [], []
 
     def process_pdf(self, pdf_path: str, output_file: str = None, max_chunks: int = 500, load_to_neo4j: bool = True):
         """Enhanced PDF processing with better quota handling and progress tracking."""
