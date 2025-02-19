@@ -9,6 +9,10 @@ import logging
 from dataclasses import asdict
 from datetime import datetime
 
+# Configure logging to be less verbose
+logging.getLogger("neo4j").setLevel(logging.WARNING)  # Only show WARNING and above for neo4j
+logger = logging.getLogger(__name__)
+
 # Neo4j Configuration (from environment variables)
 URI = os.getenv("NEO4J_URI")
 USERNAME = os.getenv("NEO4J_USERNAME")
@@ -19,43 +23,80 @@ NEO4J_CACHE_FILE = "neo4j_cache.json"
 
 class KnowledgeGraph:
     def __init__(self, uri: str, user: str, password: str):
-        """Initialize Neo4j connection."""
+        """Initialize Neo4j connection and schema if needed."""
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
         self.logger = logging.getLogger(__name__)
+        self._ensure_schema()
 
     def close(self):
         """Close the Neo4j driver."""
         self.driver.close()
 
-    def initialize_schema(self):
-        """Initialize Neo4j schema with constraints and indexes."""
+    def _ensure_schema(self):
+        """Ensure Neo4j schema exists with necessary constraints and indexes."""
         with self.driver.session() as session:
             try:
-                # Create constraints for unique identifiers
+                # Create constraints
                 constraints = [
+                    # State constraints
                     "CREATE CONSTRAINT IF NOT EXISTS FOR (s:State) REQUIRE s.name IS UNIQUE",
+                    "CREATE CONSTRAINT IF NOT EXISTS FOR (s:State) REQUIRE s.id IS UNIQUE",
+                    
+                    # Event constraints
                     "CREATE CONSTRAINT IF NOT EXISTS FOR (e:Event) REQUIRE e.name IS UNIQUE",
-                    "CREATE CONSTRAINT IF NOT EXISTS FOR (a:Action) REQUIRE (a.name, a.actor) IS UNIQUE",
+                    "CREATE CONSTRAINT IF NOT EXISTS FOR (e:Event) REQUIRE e.id IS UNIQUE",
+                    
+                    # Network element constraints
+                    "CREATE CONSTRAINT IF NOT EXISTS FOR (n:NetworkElement) REQUIRE n.name IS UNIQUE",
+                    "CREATE CONSTRAINT IF NOT EXISTS FOR (n:NetworkElement) REQUIRE n.id IS UNIQUE",
+                    
+                    # Conditional constraints
+                    "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Conditional) REQUIRE c.name IS UNIQUE",
+                    "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Conditional) REQUIRE c.id IS UNIQUE",
+                    
+                    # Parameter constraints
                     "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Parameter) REQUIRE p.name IS UNIQUE",
-                    "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Conditional) REQUIRE c.condition IS UNIQUE",
-                    "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Step) REQUIRE (s.procedure_name, s.step_number) IS UNIQUE"
+                    "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Parameter) REQUIRE p.id IS UNIQUE"
                 ]
                 
-                # Create indexes for better performance
+                # Create indexes
                 indexes = [
-                    "CREATE INDEX IF NOT EXISTS FOR (s:State) ON (s.type)",
-                    "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.type)",
-                    "CREATE INDEX IF NOT EXISTS FOR (a:Action) ON (a.actor)",
-                    "CREATE INDEX IF NOT EXISTS FOR (p:Parameter) ON (p.type)",
-                    "CREATE INDEX IF NOT EXISTS FOR (s:Step) ON (s.procedure_name)"
+                    # State indexes
+                    "CREATE INDEX IF NOT EXISTS FOR (s:State) ON (s.state_type)",
+                    "CREATE INDEX IF NOT EXISTS FOR (s:State) ON (s.entry_conditions)",
+                    "CREATE INDEX IF NOT EXISTS FOR (s:State) ON (s.exit_conditions)",
+                    
+                    # Event indexes
+                    "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.event_type)",
+                    "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.source_entity)",
+                    "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.target_entity)",
+                    
+                    # Network element indexes
+                    "CREATE INDEX IF NOT EXISTS FOR (n:NetworkElement) ON (n.element_type)",
+                    "CREATE INDEX IF NOT EXISTS FOR (n:NetworkElement) ON (n.role)",
+                    
+                    # Conditional indexes
+                    "CREATE INDEX IF NOT EXISTS FOR (c:Conditional) ON (c.condition_type)",
+                    "CREATE INDEX IF NOT EXISTS FOR (c:Conditional) ON (c.true_path)",
+                    "CREATE INDEX IF NOT EXISTS FOR (c:Conditional) ON (c.false_path)",
+                    
+                    # Parameter indexes
+                    "CREATE INDEX IF NOT EXISTS FOR (p:Parameter) ON (p.parameter_type)",
+                    "CREATE INDEX IF NOT EXISTS FOR (p:Parameter) ON (p.format)",
+                    "CREATE INDEX IF NOT EXISTS FOR (p:Parameter) ON (p.mandatory)"
                 ]
                 
+                # Execute all schema creation queries
                 for query in constraints + indexes:
                     session.run(query)
                 
-                self.logger.info("Schema initialized successfully")
+                self.logger.info("✓ Schema initialized successfully")
+                
             except Exception as e:
                 self.logger.error(f"Error initializing schema: {str(e)}")
+
+    def initialize_schema(self):
+        return
 
     def create_state(self, name: str, state_type: str, description: str = None, conditions: List[str] = None):
         """Create a state node with its properties."""
@@ -65,13 +106,49 @@ class KnowledgeGraph:
             except Exception as e:
                 self.logger.error(f"Error creating state {name}: {str(e)}")
 
-    def create_event(self, name: str, event_type: str, trigger: str = None, metadata: Dict = None):
-        """Create an event node with its properties."""
+    def create_event(self, name: str, event_type: str, source_entity: str, target_entity: str, parameters: List[str], metadata: Dict[str, Any]) -> None:
+        """Create an event node in Neo4j.
+        
+        Args:
+            name: Name of the event
+            event_type: Type of event (message, timer, internal)
+            source_entity: Entity that generates the event
+            target_entity: Entity that receives the event
+            parameters: List of parameters associated with the event
+            metadata: Additional metadata (protocol, message_type, timer_value, retry_count)
+        """
+        query = """
+        MERGE (e:Event {name: $name})
+        SET e.event_type = $event_type,
+            e.source_entity = $source_entity,
+            e.target_entity = $target_entity,
+            e.parameters = $parameters,
+            e.protocol = $protocol,
+            e.message_type = $message_type,
+            e.timer_value = $timer_value,
+            e.retry_count = $retry_count,
+            e.updated_at = datetime()
+        RETURN e
+        """
+        
         with self.driver.session() as session:
             try:
-                session.execute_write(self._create_event, name, event_type, trigger, metadata)
+                session.run(
+                    query,
+                    name=name,
+                    event_type=event_type,
+                    source_entity=source_entity,
+                    target_entity=target_entity,
+                    parameters=parameters,
+                    protocol=metadata.get("protocol"),
+                    message_type=metadata.get("message_type"),
+                    timer_value=metadata.get("timer_value"),
+                    retry_count=metadata.get("retry_count")
+                )
+                self.logger.info(f"Created/updated Event node: {name}")
             except Exception as e:
-                self.logger.error(f"Error creating event {name}: {str(e)}")
+                self.logger.error(f"Error creating Event node {name}: {str(e)}")
+                raise
 
     def create_action(self, name: str, actor: str, description: str, parameters: List[str] = None):
         """Create an action node with its properties."""
@@ -101,27 +178,18 @@ class KnowledgeGraph:
 
     @staticmethod
     def _create_state(tx, name: str, state_type: str, description: str = None, conditions: List[str] = None):
+        """Create a state node in Neo4j."""
         query = """
         MERGE (s:State {name: $name})
-        SET s.type = $type,
+        SET s.state_type = $state_type,
             s.description = $description,
-            s.conditions = $conditions,
+            s.entry_conditions = $conditions,
             s.updated_at = datetime()
         RETURN s
         """
-        tx.run(query, name=name, type=state_type, description=description, conditions=conditions)
-
-    @staticmethod
-    def _create_event(tx, name: str, event_type: str, trigger: str = None, metadata: Dict = None):
-        query = """
-        MERGE (e:Event {name: $name})
-        SET e.type = $type,
-            e.trigger = $trigger,
-            e.metadata = $metadata,
-            e.timestamp = datetime()
-        RETURN e
-        """
-        tx.run(query, name=name, type=event_type, trigger=trigger, metadata=metadata)
+        result = tx.run(query, name=name, state_type=state_type, 
+                       description=description, conditions=conditions)
+        return result.single()
 
     @staticmethod
     def _create_action(tx, name: str, actor: str, description: str, parameters: List[str] = None):
@@ -200,13 +268,21 @@ class KnowledgeGraph:
         # Create sequence relationship with previous step
         if step_number > 1:
             sequence_query = """
-            MATCH (prev:Step {procedure_name: $proc_name, step_number: $prev_num})
-            MATCH (curr:Step {procedure_name: $proc_name, step_number: $curr_num})
+            MATCH (prev:Step {
+                procedure_name: $proc_name,
+                step_number: $prev_num
+            })
+            MATCH (curr:Step {
+                procedure_name: $proc_name,
+                step_number: $curr_num
+            })
             MERGE (prev)-[r:FOLLOWED_BY]->(curr)
             RETURN prev, r, curr
             """
-            tx.run(sequence_query, proc_name=procedure_name, 
-                  prev_num=step_number-1, curr_num=step_number)
+            tx.run(sequence_query,
+                  proc_name=procedure_name,
+                  prev_num=step_number-1,
+                  curr_num=step_number)
 
     def create_state_transition(self, from_state: str, to_state: str, 
                               trigger_event: str = None, conditions: List[str] = None,
@@ -223,30 +299,33 @@ class KnowledgeGraph:
     def _create_state_transition(tx, from_state: str, to_state: str, 
                                trigger_event: str = None, conditions: List[str] = None,
                                metadata: Dict = None):
-        # Create the basic transition
-        transition_query = """
+        """Create a state transition in Neo4j."""
+        # Create the base transition
+        query = """
         MATCH (s1:State {name: $from_state})
         MATCH (s2:State {name: $to_state})
         MERGE (s1)-[r:TRANSITIONS_TO]->(s2)
         SET r.conditions = $conditions,
             r.metadata = $metadata,
-            r.timestamp = datetime()
-        RETURN s1, r, s2
+            r.updated_at = datetime()
         """
-        tx.run(transition_query, from_state=from_state, to_state=to_state,
+        tx.run(query, from_state=from_state, to_state=to_state,
                conditions=conditions, metadata=metadata)
         
         # If there's a trigger event, create it and link it
         if trigger_event:
-            event_query = """
+            query = """
             MATCH (s1:State {name: $from_state})
             MATCH (s2:State {name: $to_state})
-            MERGE (e:Event {name: $event})
-            MERGE (s1)-[r1:TRIGGERED_BY]->(e)
-            MERGE (e)-[r2:LEADS_TO]->(s2)
-            RETURN s1, e, s2
+            MERGE (e:Event {name: $trigger_event})
+            SET e.event_type = 'transition_trigger',
+                e.updated_at = datetime()
+            MERGE (e)-[t:TRIGGERS]->(s2)
+            SET t.from_state = $from_state,
+                t.updated_at = datetime()
             """
-            tx.run(event_query, from_state=from_state, to_state=to_state, event=trigger_event)
+            tx.run(query, from_state=from_state, to_state=to_state,
+                   trigger_event=trigger_event)
 
     def clear_database(self):
         """Clear all nodes and relationships from the database."""
@@ -455,7 +534,7 @@ class KnowledgeGraph:
     @staticmethod
     def _create_entity(tx, name: str, entity_type: str):
         query = """
-        MERGE (e:`3GPP Entity` {name: $name})
+        MERGE (e:ThreeGPPEntity {name: $name})
         SET e.type = $type,
             e.updated_at = datetime()
         RETURN e
@@ -538,13 +617,346 @@ class KnowledgeGraph:
     def _create_relationship(tx, from_label: str, from_key: str, 
                            rel_type: str, to_label: str, to_key: str):
         query = f"""
-        MATCH (a:{from_label} {{name: $from_key}})
-        MATCH (b:{to_label} {{name: $to_key}})
+        MATCH (a:ThreeGPPEntity {{name: $from_key}})
+        MATCH (b:ThreeGPPEntity {{name: $to_key}})
         MERGE (a)-[r:{rel_type}]->(b)
         SET r.updated_at = datetime()
         RETURN a, r, b
         """
         tx.run(query, from_key=from_key, to_key=to_key)
+
+    def store_3gpp_entities(self, data: Dict[str, Any]) -> None:
+        """Store 3GPP entities in Neo4j."""
+        with self.driver.session() as session:
+            try:
+                # Create nodes
+                for node in data.get("nodes", []):
+                    node_id = node.get("id")
+                    node_type = node.get("type")
+                    node_name = node.get("name")
+                    properties = node.get("properties", {})
+
+                    if not node_id or not node_type or not node_name:
+                        continue
+
+                    # Base query for all node types
+                    base_query = f"""
+                    MERGE (n:{node_type} {{name: $name}})
+                    SET n.id = $id,
+                        n.description = $description,
+                        n.updated_at = datetime()
+                    """
+
+                    # Additional properties based on node type
+                    if node_type == "State":
+                        query = base_query + """
+                        SET n.state_type = $state_type,
+                            n.entry_conditions = $entry_conditions,
+                            n.exit_conditions = $exit_conditions,
+                            n.metadata = $metadata
+                        """
+                        session.run(query,
+                                  name=node_name,
+                                  id=node_id,
+                                  description=properties.get("description", ""),
+                                  state_type=properties.get("state_type"),
+                                  entry_conditions=properties.get("entry_conditions", []),
+                                  exit_conditions=properties.get("exit_conditions", []),
+                                  metadata=properties.get("metadata", {}))
+
+                    elif node_type == "Event":
+                        query = base_query + """
+                        SET n.event_type = $event_type,
+                            n.source_entity = $source_entity,
+                            n.target_entity = $target_entity,
+                            n.parameters = $parameters,
+                            n.metadata = $metadata
+                        """
+                        session.run(query,
+                                  name=node_name,
+                                  id=node_id,
+                                  description=properties.get("description", ""),
+                                  event_type=properties.get("event_type"),
+                                  source_entity=properties.get("source_entity"),
+                                  target_entity=properties.get("target_entity"),
+                                  parameters=properties.get("parameters", []),
+                                  metadata=properties.get("metadata", {}))
+
+                    elif node_type == "NetworkElement":
+                        query = base_query + """
+                        SET n.element_type = $element_type,
+                            n.role = $role,
+                            n.interfaces = $interfaces,
+                            n.metadata = $metadata
+                        """
+                        session.run(query,
+                                  name=node_name,
+                                  id=node_id,
+                                  description=properties.get("description", ""),
+                                  element_type=properties.get("element_type"),
+                                  role=properties.get("role"),
+                                  interfaces=properties.get("interfaces", []),
+                                  metadata=properties.get("metadata", {}))
+
+                    elif node_type == "Conditional":
+                        query = base_query + """
+                        SET n.condition_type = $condition_type,
+                            n.true_path = $true_path,
+                            n.false_path = $false_path,
+                            n.parameters = $parameters,
+                            n.metadata = $metadata
+                        """
+                        session.run(query,
+                                  name=node_name,
+                                  id=node_id,
+                                  description=properties.get("description", ""),
+                                  condition_type=properties.get("condition_type"),
+                                  true_path=properties.get("true_path"),
+                                  false_path=properties.get("false_path"),
+                                  parameters=properties.get("parameters", []),
+                                  metadata=properties.get("metadata", {}))
+
+                    elif node_type == "Parameter":
+                        query = base_query + """
+                        SET n.parameter_type = $parameter_type,
+                            n.format = $format,
+                            n.mandatory = $mandatory,
+                            n.metadata = $metadata
+                        """
+                        session.run(query,
+                                  name=node_name,
+                                  id=node_id,
+                                  description=properties.get("description", ""),
+                                  parameter_type=properties.get("parameter_type"),
+                                  format=properties.get("format"),
+                                  mandatory=properties.get("mandatory", False),
+                                  metadata=properties.get("metadata", {}))
+
+                # Create edges
+                for edge in data.get("edges", []):
+                    source = edge.get("source")
+                    target = edge.get("target")
+                    edge_type = edge.get("type")
+                    properties = edge.get("properties", {})
+
+                    if not source or not target or not edge_type:
+                        continue
+
+                    # Create relationship based on edge type
+                    query = """
+                    MATCH (source {name: $source_name})
+                    MATCH (target {name: $target_name})
+                    MERGE (source)-[r:$edge_type]->(target)
+                    SET r += $properties,
+                        r.updated_at = datetime()
+                    """
+                    session.run(query,
+                              source_name=source,
+                              target_name=target,
+                              edge_type=edge_type.upper(),
+                              properties=properties)
+
+            except Exception as e:
+                self.logger.error(f"Error storing 3GPP entities: {str(e)}")
+                raise
+
+    def _get_protocol_description(self, protocol_name: str) -> str:
+        """Get the description for a protocol."""
+        protocol_descriptions = {
+            'NAS': 'Non-Access Stratum protocol for communication between UE and core network',
+            'RRC': 'Radio Resource Control protocol for radio resource management',
+            'GTP': 'GPRS Tunneling Protocol for user and control plane tunneling',
+            'NGAP': 'NG Application Protocol for control plane signaling',
+            'S1AP': 'S1 Application Protocol for communication between eNB and MME',
+            'X2AP': 'X2 Application Protocol for communication between eNBs'
+        }
+        return protocol_descriptions.get(protocol_name, "Protocol used in 3GPP communications")
+
+    def _get_network_element_description(self, element_name: str) -> str:
+        """Get the description for a network element."""
+        element_descriptions = {
+            'UE': 'User Equipment - The end-user device in the network',
+            'eNB': 'evolved NodeB - The base station in LTE networks',
+            'gNB': 'next generation NodeB - The base station in 5G networks',
+            'AMF': 'Access and Mobility Management Function - Handles access control and mobility',
+            'SMF': 'Session Management Function - Manages user sessions and connectivity',
+            'UPF': 'User Plane Function - Handles user data forwarding and routing',
+            'AUSF': 'Authentication Server Function - Handles user authentication',
+            'UDM': 'Unified Data Management - Manages user subscription data',
+            'PCF': 'Policy Control Function - Manages network policies',
+            'NRF': 'Network Repository Function - Service discovery and registration',
+            'NSSF': 'Network Slice Selection Function - Handles network slice selection',
+            'SGW': 'Serving Gateway - Routes and forwards user data packets',
+            'PGW': 'PDN Gateway - Provides connectivity to external networks',
+            'MME': 'Mobility Management Entity - Controls mobility in LTE networks'
+        }
+        return element_descriptions.get(element_name, "Network element in 3GPP architecture")
+
+    @staticmethod
+    def _store_3gpp_relationships(tx, relationships: List[Dict[str, Any]], source_doc: str):
+        for rel in relationships:
+            # Extract common properties
+            base_properties = {
+                'context': rel.get('context'),
+                'source_doc': source_doc,
+                'updated_at': 'datetime()',
+                'conditions': rel.get('conditions', []),
+                'triggers': rel.get('triggers', [])
+            }
+
+            # Add any custom properties from the relationship
+            if 'properties' in rel:
+                base_properties.update(rel['properties'])
+
+            if rel['type'] == 'sends':
+                query = """
+                MATCH (source:ThreeGPPEntity {name: $source_name})
+                MATCH (target:ThreeGPPEntity {name: $target_name})
+                MERGE (source)-[r:SENDS]->(target)
+                SET r = $properties,
+                    r.message = $message
+                WITH source, r, target
+                FOREACH (condition IN $conditions |
+                    MERGE (c:Conditional {condition: condition})
+                    MERGE (r)-[:HAS_CONDITION]->(c)
+                )
+                FOREACH (trigger IN $triggers |
+                    MERGE (e:Event {name: trigger})
+                    MERGE (r)-[:TRIGGERED_BY]->(e)
+                )
+                """
+                tx.run(query, 
+                      source_name=rel['source'],
+                      target_name=rel['target'],
+                      message=rel.get('message'),
+                      properties=base_properties,
+                      conditions=rel.get('conditions', []),
+                      triggers=rel.get('triggers', []))
+
+            elif rel['type'] == 'authenticates':
+                query = """
+                MATCH (source:ThreeGPPEntity {name: $source_name})
+                MATCH (target:ThreeGPPEntity {name: $target_name})
+                MERGE (source)-[r:AUTHENTICATES]->(target)
+                SET r = $properties
+                WITH source, r, target
+                FOREACH (condition IN $conditions |
+                    MERGE (c:Conditional {condition: condition})
+                    MERGE (r)-[:HAS_CONDITION]->(c)
+                )
+                FOREACH (trigger IN $triggers |
+                    MERGE (e:Event {name: trigger})
+                    MERGE (r)-[:TRIGGERED_BY]->(e)
+                )
+                """
+                tx.run(query,
+                      source_name=rel['source'],
+                      target_name=rel['target'],
+                      properties=base_properties,
+                      conditions=rel.get('conditions', []),
+                      triggers=rel.get('triggers', []))
+
+            elif rel['type'] == 'establishes':
+                query = """
+                MATCH (source:ThreeGPPEntity {name: $source_name})
+                MATCH (target:ThreeGPPEntity {name: $target_name})
+                MERGE (source)-[r:ESTABLISHES]->(target)
+                SET r = $properties,
+                    r.connection_type = $connection_type
+                WITH source, r, target
+                FOREACH (condition IN $conditions |
+                    MERGE (c:Conditional {condition: condition})
+                    MERGE (r)-[:HAS_CONDITION]->(c)
+                )
+                FOREACH (trigger IN $triggers |
+                    MERGE (e:Event {name: trigger})
+                    MERGE (r)-[:TRIGGERED_BY]->(e)
+                )
+                """
+                tx.run(query,
+                      source_name=rel['source'],
+                      target_name=rel['target'],
+                      connection_type=rel.get('message'),
+                      properties=base_properties,
+                      conditions=rel.get('conditions', []),
+                      triggers=rel.get('triggers', []))
+
+            elif rel['type'] == 'state_transition':
+                query = """
+                MATCH (from_state:ThreeGPPEntity {name: $from_state})
+                MATCH (to_state:ThreeGPPEntity {name: $to_state})
+                MERGE (from_state)-[r:TRANSITIONS_TO]->(to_state)
+                SET r = $properties
+                WITH from_state, r, to_state
+                FOREACH (condition IN $conditions |
+                    MERGE (c:Conditional {condition: condition})
+                    MERGE (r)-[:HAS_CONDITION]->(c)
+                )
+                FOREACH (trigger IN $triggers |
+                    MERGE (e:Event {name: trigger, type: 'transition_trigger'})
+                    SET e.description = 'Event triggering state transition'
+                    MERGE (r)-[:TRIGGERED_BY]->(e)
+                )
+                """
+                tx.run(query,
+                      from_state=rel['source'],
+                      to_state=rel['target'],
+                      properties=base_properties,
+                      conditions=rel.get('conditions', []),
+                      triggers=rel.get('triggers', []))
+
+    def store_events_and_triggers(self, events: List[Dict[str, Any]], source_doc: str):
+        """Store events and their triggers in Neo4j."""
+        with self.driver.session() as session:
+            try:
+                session.execute_write(self._store_events_and_triggers, events, source_doc)
+            except Exception as e:
+                self.logger.error(f"Error storing events and triggers: {str(e)}")
+
+    @staticmethod
+    def _store_events_and_triggers(tx, events: List[Dict[str, Any]], source_doc: str):
+        for event in events:
+            query = """
+            MERGE (e:Event {name: $name})
+            SET e.type = $type,
+                e.description = $description,
+                e.source_doc = $source_doc,
+                e.updated_at = datetime()
+            WITH e
+            FOREACH (trigger IN $triggers |
+                MERGE (t:Trigger {name: trigger})
+                MERGE (t)-[:TRIGGERS]->(e)
+            )
+            FOREACH (condition IN $conditions |
+                MERGE (c:Conditional {condition: condition})
+                MERGE (e)-[:HAS_CONDITION]->(c)
+            )
+            """
+            tx.run(query,
+                  name=event['name'],
+                  type=event.get('type', 'protocol_event'),
+                  description=event.get('description', 'Event in 3GPP protocol'),
+                  source_doc=source_doc,
+                  triggers=event.get('triggers', []),
+                  conditions=event.get('conditions', []))
+
+    def store_conditions(self, conditions: List[Dict[str, Any]], source_doc: str):
+        """Store conditions and their relationships in Neo4j."""
+        with self.driver.session() as session:
+            try:
+                session.execute_write(self._store_conditions, conditions, source_doc)
+            except Exception as e:
+                self.logger.error(f"Error storing conditions: {str(e)}")
+
+    @staticmethod
+    def _store_conditions(tx, conditions: List[Dict[str, Any]], source_doc: str):
+        """Store conditions in Neo4j."""
+        for condition in conditions:
+            # Create condition node
+            query = (
+                "CREATE (c:Condition {condition: $condition, source_doc: $source_doc})"
+            )
+            tx.run(query, condition=condition, source_doc=source_doc)
 
 def clean_text(text: str) -> str:
     """Clean text by removing unwanted characters and normalizing whitespace."""
@@ -591,92 +1003,327 @@ def normalize_entity_name(name: str) -> str:
     return name.strip()
 
 def store_in_neo4j(processed_docs):
-    """Store extracted entities and relationships in Neo4j with improved deduplication."""
+    """Store extracted entities and relationships in Neo4j with improved state machine handling."""
     uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
     username = os.getenv("NEO4J_USERNAME", "neo4j")
     password = os.getenv("NEO4J_PASSWORD")
 
     driver = GraphDatabase.driver(uri, auth=(username, password))
 
+    def flatten_properties(props):
+        """Flatten nested properties and convert to primitive types."""
+        flattened = {}
+        for key, value in props.items():
+            if isinstance(value, (str, int, float, bool)):
+                flattened[key] = value
+            elif isinstance(value, list):
+                # Convert list items to strings if they're not primitive types
+                flattened[key] = [str(item) if not isinstance(item, (str, int, float, bool)) else item 
+                                for item in value]
+            elif isinstance(value, dict):
+                # For metadata dictionaries, keep them as separate properties
+                if key == "metadata":
+                    for meta_key, meta_value in value.items():
+                        flattened[f"metadata_{meta_key}"] = str(meta_value)
+                else:
+                    # For other dictionaries, convert to string
+                    flattened[key + "_str"] = str(value)
+            else:
+                # Convert any other types to string
+                flattened[key] = str(value)
+        return flattened
+
     with driver.session() as session:
-        # First, create a unique constraint if it doesn't exist
+        # First, clear all existing nodes and relationships
+        print("Clearing existing database...")
         try:
-            session.run("""
-                CREATE CONSTRAINT unique_entity_name IF NOT EXISTS
-                FOR (e:`3GPP Entity`)
-                REQUIRE (e.name, e.type) IS UNIQUE
-            """)
+            session.run("MATCH (n) DETACH DELETE n")
+            print("✓ Database cleared successfully")
         except Exception as e:
-            print(f"Warning: Could not create constraint: {str(e)}")
+            print(f"Warning: Could not clear database: {str(e)}")
 
+        # Process each document
         for doc in processed_docs:
-            entities = doc["entities"]
-            relationships = doc["relationships"]
+            entities = doc.get("nodes", [])
+            relationships = doc.get("edges", [])
 
-            # Create nodes for each entity using MERGE to avoid duplicates
-            for entity, entity_type in entities:
+            # Create nodes for each entity
+            print(f"Creating {len(entities)} nodes...")
+            for entity in entities:
                 try:
+                    # Determine the correct label based on node type
+                    node_type = entity["type"]
+                    if node_type == "state":
+                        label = "State"
+                    elif node_type == "event":
+                        label = "Event"
+                    elif node_type == "network_element":
+                        label = "NetworkElement"
+                    elif node_type == "conditional":
+                        label = "Conditional"
+                    else:
+                        label = "Node"
+                    
                     # Clean and normalize entity name
-                    clean_name = clean_text(entity)
-                    normalized_name = normalize_entity_name(entity)
-                    clean_type = clean_text(entity_type)
+                    clean_name = clean_text(entity["name"])
+                    normalized_name = normalize_entity_name(entity["name"])
                     
+                    # Flatten properties to primitive types
+                    properties = flatten_properties(entity.get("properties", {}))
+                    
+                    # Create node with appropriate label and properties
+                    query = f"""
+                    MERGE (n:{label} {{name: $name}})
+                    SET n.normalized_name = $normalized_name,
+                        n.clean_name = $clean_name,
+                        n += $properties
+                    """
                     session.run(
-                        """
-                        MERGE (e:`3GPP Entity` {normalized_name: $normalized_name})
-                        ON CREATE SET 
-                            e.name = $name,
-                            e.type = $type,
-                            e.clean_name = $clean_name
-                        ON MATCH SET 
-                            e.name = CASE 
-                                WHEN length($clean_name) > length(e.clean_name) THEN $name 
-                                ELSE e.name 
-                            END,
-                            e.clean_name = CASE 
-                                WHEN length($clean_name) > length(e.clean_name) THEN $clean_name 
-                                ELSE e.clean_name 
-                            END
-                        """,
+                        query,
+                        name=entity["name"],
                         normalized_name=normalized_name,
-                        name=entity,
                         clean_name=clean_name,
-                        type=clean_type
+                        properties=properties
                     )
                 except Exception as e:
-                    print(f"Error creating entity '{entity}': {str(e)}")
+                    print(f"Error creating entity '{entity['name']}': {str(e)}")
 
-            # Create relationships between entities with deduplication
-            for entity1, entity2, relationship_type, properties in relationships:
+            # Create relationships between nodes
+            print(f"Creating {len(relationships)} relationships...")
+            for edge in relationships:
                 try:
-                    # Clean and normalize entity names and properties
-                    norm_entity1 = normalize_entity_name(entity1)
-                    norm_entity2 = normalize_entity_name(entity2)
-                    clean_rel_type = clean_text(relationship_type)
+                    # Flatten relationship properties
+                    props = flatten_properties(edge.get("properties", {}))
                     
-                    # Clean all property values
-                    clean_properties = {}
-                    for key, value in properties.items():
-                        if isinstance(value, str):
-                            clean_properties[key] = clean_text(value)
-                        else:
-                            clean_properties[key] = value
+                    # Create relationship with explicit type
+                    query = f"""
+                    MATCH (source) WHERE source.name = $source_name
+                    MATCH (target) WHERE target.name = $target_name
+                    MERGE (source)-[r:{edge['type'].upper()}]->(target)
+                    SET r += $props
+                    """
                     
                     session.run(
-                        """
-                        MATCH (e1:`3GPP Entity` {normalized_name: $entity1}), 
-                              (e2:`3GPP Entity` {normalized_name: $entity2})
-                        WHERE NOT EXISTS((e1)-[r:$rel_type]->(e2) WHERE r.description = $desc)
-                        MERGE (e1)-[r:$rel_type]->(e2)
-                        ON CREATE SET r += $props
-                        """,
-                        entity1=norm_entity1,
-                        entity2=norm_entity2,
-                        rel_type=clean_rel_type,
-                        desc=clean_properties.get('description', ''),
-                        props=clean_properties
+                        query,
+                        source_name=edge["source"],
+                        target_name=edge["target"],
+                        props=props
                     )
                 except Exception as e:
-                    print(f"Error creating relationship between '{entity1}' and '{entity2}': {str(e)}")
+                    print(f"Error creating relationship between '{edge['source']}' and '{edge['target']}': {str(e)}")
+
+        print("✓ Data loading completed successfully")
 
     driver.close()
+
+def process_3gpp_data(json_file: str):
+    """Process extracted 3GPP data and store in Neo4j."""
+    # Read Neo4j credentials from environment
+    uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    user = os.getenv("NEO4J_USERNAME", "neo4j")
+    password = os.getenv("NEO4J_PASSWORD")
+    
+    if not password:
+        raise ValueError("NEO4J_PASSWORD environment variable not set")
+    
+    # Initialize Neo4j connection
+    graph = KnowledgeGraph(uri, user, password)
+    
+    try:
+        # Initialize schema
+        graph.initialize_schema()
+        
+        # Read the JSON file
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Process each procedure
+        for procedure in data['procedures']:
+            # Store entities
+            graph.store_3gpp_entities(procedure['entities'], data['source_document'])
+            
+            # Store relationships
+            if 'relationships' in procedure:
+                graph.store_3gpp_relationships(procedure['relationships'], data['source_document'])
+        
+        print(f"Successfully processed {len(data['procedures'])} procedures")
+        
+    except Exception as e:
+        print(f"Error processing 3GPP data: {str(e)}")
+    finally:
+        graph.close()
+
+def load_graph_data(json_file: str):
+    """Load extracted graph data into Neo4j."""
+    # Read Neo4j credentials from environment
+    uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    user = os.getenv("NEO4J_USERNAME", "neo4j")
+    password = os.getenv("NEO4J_PASSWORD")
+    
+    if not password:
+        raise ValueError("NEO4J_PASSWORD environment variable not set")
+    
+    # Initialize Neo4j connection
+    graph = KnowledgeGraph(uri, user, password)
+    
+    try:
+        # Initialize schema
+        graph._ensure_schema()
+        
+        # Read the JSON file
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Store entities and relationships
+        graph.store_3gpp_entities(data)
+        
+        print(f"Successfully loaded graph data from {json_file}")
+        print(f"Nodes created: {len(data.get('nodes', []))}")
+        print(f"Edges created: {len(data.get('edges', []))}")
+        
+        # Print node type distribution
+        node_types = {}
+        for node in data.get("nodes", []):
+            node_type = node.get("type")
+            if node_type:
+                node_types[node_type] = node_types.get(node_type, 0) + 1
+        
+        print("\nNode type distribution:")
+        for ntype, count in sorted(node_types.items()):
+            print(f"- {ntype}: {count}")
+        
+        # Print edge type distribution
+        edge_types = {}
+        for edge in data.get("edges", []):
+            edge_type = edge.get("type")
+            if edge_type:
+                edge_types[edge_type] = edge_types.get(edge_type, 0) + 1
+        
+        print("\nEdge type distribution:")
+        for etype, count in sorted(edge_types.items()):
+            print(f"- {etype}: {count}")
+        
+    except Exception as e:
+        print(f"Error loading graph data: {str(e)}")
+        raise
+    finally:
+        graph.close()
+
+def verify_neo4j_data():
+    """Verify the data loaded in Neo4j and print statistics."""
+    uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    username = os.getenv("NEO4J_USERNAME", "neo4j")
+    password = os.getenv("NEO4J_PASSWORD")
+    
+    if not password:
+        raise ValueError("NEO4J_PASSWORD environment variable not set")
+    
+    driver = GraphDatabase.driver(uri, auth=(username, password))
+
+    with driver.session() as session:
+        # Count nodes by label
+        result = session.run("""
+            CALL db.labels() YIELD label
+            CALL {
+                WITH label
+                MATCH (n)
+                WHERE label in labels(n)
+                RETURN count(n) as count
+            }
+            RETURN label, count
+            ORDER BY count DESC
+        """)
+        print("\nNodes by label:")
+        for record in result:
+            print(f"  {record['label']}: {record['count']}")
+        
+        # Count relationships by type
+        result = session.run("""
+            CALL db.relationshipTypes() YIELD relationshipType
+            CALL {
+                WITH relationshipType
+                MATCH ()-[r]->()
+                WHERE type(r) = relationshipType
+                RETURN count(r) as count
+            }
+            RETURN relationshipType, count
+            ORDER BY count DESC
+        """)
+        print("\nRelationships by type:")
+        for record in result:
+            print(f"  {record['relationshipType']}: {record['count']}")
+        
+        # Verify state machine structure
+        result = session.run("""
+            MATCH (s:State)
+            WITH s.state_type as type, count(*) as count
+            RETURN type, count
+            ORDER BY count DESC
+        """)
+        print("\nStates by type:")
+        for record in result:
+            print(f"  {record['type']}: {record['count']}")
+        
+        # Verify event triggers
+        result = session.run("""
+            MATCH (e:Event)-[:TRIGGERS]->(s:State)
+            RETURN e.event_type as type, count(*) as count
+            ORDER BY count DESC
+        """)
+        print("\nEvent triggers by type:")
+        for record in result:
+            print(f"  {record['type']}: {record['count']}")
+    
+    driver.close()
+
+def print_visualization_queries():
+    """Print example queries for visualizing the state machine in Neo4j Browser."""
+    print("\nExample queries for Neo4j Browser visualization:")
+    
+    print("\n1. View complete state machine flow:")
+    print("""
+    MATCH (s:State)
+    OPTIONAL MATCH (s)-[r]->(t)
+    RETURN s, r, t;
+    """)
+    
+    print("\n2. View state transitions with events:")
+    print("""
+    MATCH (s1:State)-[r:TRANSITIONS_TO]->(s2:State)
+    OPTIONAL MATCH (e:Event)-[tr:TRIGGERS]->(s2)
+    RETURN s1, r, s2, e, tr;
+    """)
+    
+    print("\n3. View conditional transitions:")
+    print("""
+    MATCH (s:State)-[r]->(c:Conditional)
+    OPTIONAL MATCH (c)-[t:TRANSITIONS_TO]->(s2:State)
+    RETURN s, r, c, t, s2;
+    """)
+    
+    print("\n4. View network element interactions:")
+    print("""
+    MATCH (n:NetworkElement)-[r]->(m:NetworkElement)
+    OPTIONAL MATCH (e:Event)-[tr:TRIGGERS]->(s:State)
+    WHERE e.metadata_source = n.name AND e.metadata_target = m.name
+    RETURN n, r, m, e, tr, s;
+    """)
+    
+    print("\n5. View complete attach procedure flow:")
+    print("""
+    MATCH p = (start:State {name: 'UE_POWERED_ON'})-[*]->(end:State {name: 'UE_ATTACHED'})
+    UNWIND relationships(p) as r
+    WITH DISTINCT r
+    MATCH (s)-[r]->(t)
+    RETURN s, r, t;
+    """)
+
+if __name__ == "__main__":
+    # Load the extracted graph data
+    json_file = "processed_data/3gpp_graph.json"
+    if os.path.exists(json_file):
+        load_graph_data(json_file)
+        verify_neo4j_data()
+        print_visualization_queries()
+    else:
+        print(f"JSON file not found: {json_file}")

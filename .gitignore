@@ -18,7 +18,9 @@ __pycache__/
 *$py.class
 
 # Processed data
-processed_chunks.pkl
+processed_data/
+# Ignore all files in processed_data directory
+processed_data/*
 
 # IDE
 .vscode/
